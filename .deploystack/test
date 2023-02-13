@@ -1,0 +1,174 @@
+
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# I think it's a good idea to test your scripts. It's kinda awkward but you'll 
+# be happy you did 
+
+
+# DON'T REMOVE FROM test script.
+CYAN='\033[0;36m'
+BCYAN='\033[1;36m'
+NC='\033[0m' # No Color
+DIVIDER=$(printf %"$(tput cols)"s | tr " " "*")
+DIVIDER+="\n"
+
+function get_project_id() {
+    local __resultvar=$1
+    VALUE=$(gcloud config get-value project | xargs)
+    eval $__resultvar="'$VALUE'"
+}
+
+function get_project_number() {
+    local __resultvar=$1
+    local PRO=$2
+    VALUE=$(gcloud projects list --filter="project_id=$PRO" --format="value(PROJECT_NUMBER)" | xargs)
+    eval $__resultvar="'$VALUE'"
+}
+
+# DISPLAY HELPERS
+function section_open() {
+    section_description=$1
+    printf "$DIVIDER"
+    printf "${CYAN}$section_description${NC} \n"
+    printf "$DIVIDER"
+}
+
+function section_close() {
+    printf "$DIVIDER"
+    printf "${CYAN}$section_description ${BCYAN}- done${NC}\n"
+    printf "\n\n"
+}
+
+function evalTest() {
+    local command=$1
+    local expected=$2
+
+    local ERR=""
+    got=$(eval $command 2>errFile)
+    ERR=$(<errFile)
+
+    if [ ${#ERR} -gt 0 ]; then
+        if [ "$expected" = "EXPECTERROR" ]; then
+            printf "ok \n"
+            return
+        fi
+
+        printf "expecting no error, got error='$ERR'   \n"
+        exit 1
+    fi
+
+    if [ "$got" != "$expected" ]; then
+        printf "expecting: '$expected' got: '$got'  \n"
+        exit 1
+    fi
+
+    printf "$expected is ok\n"
+}
+# END DON'T REMOVE FROM test script.
+
+
+
+get_project_id PROJECT
+gcloud services enable cloudresourcemanager.googleapis.com --project=$PROJECT
+get_project_number PROJECT_NUMBER $PROJECT
+REGION=us-central1
+ZONE=us-central1-f
+BASENAME=three-tier-app
+terraformDIR=terraform
+
+gcloud config set project ${PROJECT}
+
+terraform -chdir="$terraformDIR"  init
+terraform -chdir="$terraformDIR"  apply -auto-approve -var project_id="${PROJECT}" -var project_number="${PROJECT_NUMBER}" -var region="${REGION}" -var basename="${BASENAME}" -var zone="${ZONE}"
+
+SQLNAME=$(terraform -chdir="$terraformDIR"  output -raw sqlservername)
+API_URL=$(terraform -chdir="$terraformDIR" output -raw api)
+FE_URL=$(terraform -chdir="$terraformDIR" output -raw endpoint)
+
+section_open "Testing Secrets"
+    evalTest 'gcloud secrets describe sqlhost --format="value(name)" | xargs' "projects/$PROJECT_NUMBER/secrets/sqlhost"
+    evalTest 'gcloud secrets describe redishost --format="value(name)"' "projects/$PROJECT_NUMBER/secrets/redishost"
+section_close
+
+section_open "Test Cloud Run Services"
+    evalTest 'gcloud run services describe three-tier-app-fe --region=$REGION --format="value(name)"' "three-tier-app-fe"
+    evalTest 'gcloud run services describe three-tier-app-api --region=$REGION --format="value(name)"' "three-tier-app-api"
+section_close
+
+section_open "Test SQL Server"
+    evalTest 'gcloud sql instances describe $SQLNAME --format="value(name)"' $SQLNAME
+section_close
+
+section_open "Test Redis Server "
+    evalTest 'gcloud redis instances describe $BASENAME-cache --region=$REGION --format="value(name)"' "projects/$PROJECT/locations/$REGION/instances/$BASENAME-cache"
+section_close
+
+section_open "Testing VPN"
+    evalTest 'gcloud compute networks vpc-access connectors describe $BASENAME-vpc-cx --region $REGION --format="value(name)"' "projects/$PROJECT/locations/$REGION/connectors/$BASENAME-vpc-cx"
+    evalTest 'gcloud compute addresses describe $BASENAME-vpc-address --global --format="value(name)"' "$BASENAME-vpc-address"
+section_close
+
+# This is a bug. Everytime this command runs "Encryption: Google Managed Key gets thrown in STDERR"
+section_open "Testing Artifact Registry repository for containers"
+    evalTest 'gcloud artifacts repositories describe three-tier-app-app --location $REGION --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Testing Endpoint is working"
+    evalTest 'curl -s -o /dev/null -w "%{http_code}" $FE_URL' "200"
+section_close
+
+section_open "Testing API is working"
+    evalTest 'curl -s -o /dev/null -w "%{http_code}" $API_URL/api/v1/todo' "200"
+section_close
+
+section_open "Testing JS is written properly"
+    stripped=$(echo ${API_URL/https:\/\//})
+    curl -o tmp $FE_URL/js/main.js
+    evalTest "cat tmp | grep -c ${stripped}" "1" 
+section_close
+
+terraform -chdir="$terraformDIR" destroy -auto-approve -var project_id="${PROJECT}" -var project_number="${PROJECT_NUMBER}" -var region="${REGION}" -var basename="${BASENAME}" -var zone="${ZONE}"
+
+section_open "Testing Secrets"
+    evalTest 'gcloud secrets describe sqlhost --format="value(name)"' "EXPECTERROR"
+    evalTest 'gcloud secrets describe redishost --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Test Cloud Run Services"
+    evalTest 'gcloud run services describe three-tier-app-fe --region=$REGION --format="value(name)"' "EXPECTERROR"
+    evalTest 'gcloud run services describe three-tier-app-api --region=$REGION --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Test SQL Server"
+    evalTest 'gcloud sql instances describe $SQLNAME --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Test Redis Server "
+    evalTest 'gcloud redis instances describe $BASENAME-cache --region=$REGION --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Testing VPN"
+    evalTest 'gcloud compute networks vpc-access connectors describe $BASENAME-vpc-cx --region $REGION --format="value(name)"' "EXPECTERROR"
+    evalTest 'gcloud compute addresses describe $BASENAME-vpc-address --global --format="value(name)"' "EXPECTERROR"
+section_close
+
+section_open "Testing Artifact Registry repoistory for containers"
+    evalTest 'gcloud artifacts repositories describe three-tier-app-app --location $REGION --format="value(name)"' "EXPECTERROR"
+section_close
+
+printf "$DIVIDER"
+printf "CONGRATS!!!!!!! \n"
+printf "You got the end the of your test with everything working. \n"
+printf "$DIVIDER"
